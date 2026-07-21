@@ -32,4 +32,5 @@ desktop.ini
 # macos/build/ScreenFlip-<version>.dmg), so re-include just the built DMG despite
 # the build/ rule above — without un-ignoring .DS_Store, the loose .app, etc.
 !macos/build/
+macos/build/*
 !macos/build/*.dmg

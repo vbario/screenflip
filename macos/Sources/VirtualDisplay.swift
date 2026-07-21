@@ -22,8 +22,8 @@ final class VirtualDisplay {
         // Pick a physical size that yields ~109 dpi (typical desktop monitor).
         desc.sizeInMillimeters = CGSize(width: Double(width) / 109.0 * 25.4,
                                         height: Double(height) / 109.0 * 25.4)
-        desc.productID = 0x5350
-        desc.vendorID = 0x5346
+        desc.productID = Displays.workspaceProductID
+        desc.vendorID = Displays.workspaceVendorID
         desc.serialNum = serial
         desc.queue = DispatchQueue(label: "io.vbar.screenflip.vd.\(serial)")
         desc.terminationHandler = { [weak self] in
@@ -48,16 +48,6 @@ final class VirtualDisplay {
         self.display = d
         self.displayID = d.displayID
         Log.line("VirtualDisplay created id=\(displayID) \(width)x\(height)")
-    }
-
-    /// Move the virtual display to an isolated origin so the OS cursor can never wander
-    /// onto it through normal arrangement edges — we drive it explicitly instead.
-    func reposition(toCG origin: CGPoint) {
-        var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return }
-        CGConfigureDisplayOrigin(config, displayID, Int32(origin.x), Int32(origin.y))
-        CGCompleteDisplayConfiguration(config, .forSession)
-        Log.line("VirtualDisplay \(displayID) origin -> \(origin); bounds=\(CGDisplayBounds(displayID))")
     }
 
     func destroy() {

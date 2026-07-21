@@ -4,10 +4,14 @@ import ScreenCaptureKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var controllers: [String: Any] = [:]      // uuid -> FlipController
-    private var selected: Set<String> = []            // uuids the user wants flipped
+    // One flipped output at a time: every workspace competes for the same arrangement
+    // slot beside the anchor display. A set is kept only for compatibility with the
+    // v0.3 UserDefaults format; reconcile collapses legacy multi-selections.
+    private var selected: Set<String> = []            // uuid of the display to flip
     private let defaultsKey = "flippedDisplayUUIDs"
     private let cursorFlipKey = "flipCursor"
-    private var savedArrangement: [CGDirectDisplayID: CGPoint] = [:]
+    private var savedArrangement: [String: CGPoint] = [:]    // display uuid -> origin
+    private var pendingScreensChange: DispatchWorkItem?
     private var requestedScreenRecordingThisLaunch = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -21,13 +25,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         selected = Set(UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [])
         Log.line("restored selection: \(selected)")
-        for d in Displays.all() { Log.line("display \(d.id): \"\(d.label)\" uuid=\(d.uuid)") }
+        for d in Displays.all() {
+            Log.line("display \(d.id): \"\(d.label)\" uuid=\(d.uuid)\(d.isWorkspace ? " [workspace]" : "")")
+        }
 
         setupStatusItem()
 
-        // Warm up Screen Recording permission (the first SCShareableContent call triggers
-        // the prompt). We do this even with nothing selected so the toggle is instant later.
-        primeScreenRecordingPermission()
+        // Only ask for Screen Recording when there's a remembered output to resume —
+        // prompting merely because a menu-bar app launched reads as a surprise. A fresh
+        // selection triggers the prompt from toggleDisplay instead.
+        if !selected.isEmpty {
+            primeScreenRecordingPermission()
+        }
 
         // React to display hotplug / rearrangement.
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
@@ -75,16 +84,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let active = Displays.all()
+        let active = Displays.eligibleOutputs()
         let activeByUUID = Dictionary(uniqueKeysWithValues: active.map { ($0.uuid, $0) })
 
+        // v0.3 allowed multiple selections even though every controller competed for
+        // the same arrangement slot. Collapse an old preference deterministically.
+        let activeSelections = active.filter { selected.contains($0.uuid) }
+        if activeSelections.count > 1, let keep = activeSelections.first {
+            selected = [keep.uuid]
+            persistSelection()
+            Log.line("migrated multiple selections; keeping \(keep.uuid)")
+        }
+
         // Stop controllers that are no longer selected, whose physical display vanished,
-        // or whose virtual workspace died (system terminated it / creation failed) — the
-        // last group gets recreated below with a fresh workspace.
+        // whose virtual workspace died (system terminated it / creation failed), or whose
+        // output changed size (reconnect at a different resolution) — the last two groups
+        // get recreated below with a fresh workspace.
         for (uuid, ctrl) in controllers {
             let fc = ctrl as? FlipController
-            guard !selected.contains(uuid) || activeByUUID[uuid] == nil
-                    || fc?.workspaceAlive != true else { continue }
+            let keep = selected.contains(uuid) && activeByUUID[uuid] != nil
+                    && fc?.workspaceAlive == true && fc?.needsRebuild != true
+            guard !keep else { continue }
             fc?.stop()
             controllers[uuid] = nil
         }
@@ -109,20 +129,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleDisplay(_ sender: NSMenuItem) {
         guard let uuid = sender.representedObject as? String else { return }
-        if selected.contains(uuid) { selected.remove(uuid) } else { selected.insert(uuid) }
-        UserDefaults.standard.set(Array(selected), forKey: defaultsKey)
+        if selected.contains(uuid) {
+            selected.removeAll()
+        } else {
+            selected = [uuid]        // single output — selecting one deselects the rest
+        }
+        persistSelection()
+        if !selected.isEmpty {
+            // Ask in direct response to the user's choice instead of surprising them
+            // with a privacy prompt merely because the menu-bar app launched.
+            primeScreenRecordingPermission()
+        }
         reconcile()
         rebuildMenu()
+    }
+
+    private func persistSelection() {
+        UserDefaults.standard.set(Array(selected), forKey: defaultsKey)
     }
 
     @objc private func screensChanged() {
         guard !reconciling else { return }
         Log.line("display configuration changed")
+        // Overlays track their output immediately so a rearrangement never leaves a
+        // flipped picture parked over the wrong display…
         if #available(macOS 13.0, *) {
             for ctrl in controllers.values { (ctrl as? FlipController)?.repositionOverlay() }
         }
-        reconcile()
-        rebuildMenu()
+        // …but reconcile only after the burst settles: one hotplug fires several of
+        // these notifications, and rebuilding workspaces against half-settled bounds
+        // is how duplicate workspaces and wrong-display flips happened mid-session.
+        pendingScreensChange?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if #available(macOS 13.0, *) {
+                for ctrl in self.controllers.values { (ctrl as? FlipController)?.repositionOverlay() }
+            }
+            self.reconcile()
+            self.rebuildMenu()
+        }
+        pendingScreensChange = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     // MARK: Menu
@@ -133,20 +180,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildMenu() {
         let menu = NSMenu()
-        let header = NSMenuItem(title: "Flip which displays:", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "Flip one external display:", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
-        for d in Displays.all() {
-            let item = NSMenuItem(title: d.label, action: #selector(toggleDisplay(_:)), keyEquivalent: "")
-            item.representedObject = d.uuid
-            item.state = selected.contains(d.uuid) ? .on : .off
-            item.target = self
+        for d in Displays.physical() {
+            let suffix = d.isMain ? " (not available)" : ""
+            let item = NSMenuItem(title: d.label + suffix,
+                                  action: d.isMain ? nil : #selector(toggleDisplay(_:)),
+                                  keyEquivalent: "")
+            if d.isMain {
+                item.isEnabled = false
+            } else {
+                item.representedObject = d.uuid
+                item.state = selected.contains(d.uuid) ? .on : .off
+                item.target = self
+            }
             menu.addItem(item)
         }
 
+        if Displays.eligibleOutputs().isEmpty {
+            let empty = NSMenuItem(title: "Connect a second display to begin", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+
         menu.addItem(.separator())
-        let note = NSMenuItem(title: "Selected displays become flipped workspaces", action: nil, keyEquivalent: "")
+        let noteTitle = controllers.isEmpty ? "Inactive" : "Active — the flipped display mirrors its hidden workspace"
+        let note = NSMenuItem(title: noteTitle, action: nil, keyEquivalent: "")
         note.isEnabled = false
         menu.addItem(note)
 

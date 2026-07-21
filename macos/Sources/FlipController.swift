@@ -1,19 +1,19 @@
 import AppKit
 import ScreenCaptureKit
 
-/// Maps a physical output display to its hidden virtual workspace, for the cursor proxy.
+/// Ties a physical output display to its hidden virtual workspace, for the cursor
+/// proxy. Geometry is deliberately NOT cached here — display bounds go stale the
+/// moment the OS adjusts the arrangement (hotplug, resolution change, overlap
+/// resolution), so consumers must look rects up live by display ID.
 struct WorkspaceMapping {
-    let pRect: CGRect          // physical output (where the user looks), CG global
-    let pDisplayID: CGDirectDisplayID
-    let vOrigin: CGPoint       // virtual workspace origin, CG global
-    let vSize: CGSize          // virtual workspace pixel size
-    let vDisplayID: CGDirectDisplayID
+    let pDisplayID: CGDirectDisplayID     // physical output (where the user looks)
+    let vDisplayID: CGDirectDisplayID     // hidden virtual workspace
 }
 
 /// Owns one "virtual flipped workspace":
 ///  • a headless virtual display V — placed in the arrangement as a NORMAL extended
-///    display immediately to the RIGHT of the main screen, so the cursor flows onto it
-///    natively (no input interception);
+///    display immediately to the RIGHT of the anchor screen, so the cursor flows onto
+///    it natively (no input interception);
 ///  • the chosen PHYSICAL output P — moved just past V and covered with a full-screen
 ///    overlay that shows V captured + horizontally flipped.
 /// The user looks at P and sees the workspace mirrored; the cursor lives natively on V.
@@ -25,6 +25,7 @@ final class FlipController {
     private let capture = Capture()
     private let axis: FlipAxis
     private var virtual: VirtualDisplay?
+    private var createdOutputSize: CGSize = .zero
     var onNeedsReconcile: (() -> Void)?
     private(set) var mapping: WorkspaceMapping?
 
@@ -39,8 +40,10 @@ final class FlipController {
     }
 
     func start() {
-        let w = Int(CGDisplayBounds(displayID).width)
-        let h = Int(CGDisplayBounds(displayID).height)
+        let pBounds = CGDisplayBounds(displayID)
+        let w = Int(pBounds.width)
+        let h = Int(pBounds.height)
+        createdOutputSize = pBounds.size
         guard let vd = VirtualDisplay(width: w, height: h, name: "ScreenFlip Workspace", serial: displayID) else {
             Log.line("FlipController: failed to create virtual display for output \(displayID)"); return
         }
@@ -53,23 +56,36 @@ final class FlipController {
         }
         virtual = vd
 
-        // Arrange: main | V (workspace), with P (physical output) hanging off V's
-        // bottom-right CORNER. The cursor crosses main->V natively (V acts as a normal
-        // display to main's right). Corner contact keeps the arrangement legal (displays
-        // must touch) but leaves no shared edge, so the cursor cannot roll off the far
-        // side of the workspace onto P — where the OS would draw a real, unmirrored
-        // cursor on top of the flipped picture. MirrorInput's edge guard backstops this.
-        if let main = Displays.main() {
-            let vOrigin = CGPoint(x: main.bounds.maxX, y: main.bounds.minY)
-            let pOrigin = CGPoint(x: main.bounds.maxX + CGFloat(w), y: main.bounds.minY + CGFloat(h))
+        // Arrange: anchor | V (workspace), with P (physical output) hanging off V's
+        // bottom-right CORNER. The cursor crosses anchor->V natively (V acts as a
+        // normal display to the anchor's right). Corner contact keeps the arrangement
+        // legal (displays must touch) but leaves no shared edge, so the cursor cannot
+        // roll off the far side of the workspace onto P — where the OS would draw a
+        // real, unmirrored cursor on top of the flipped picture. MirrorInput's edge
+        // guard backstops this.
+        //
+        // The anchor is a live-resolved physical display OTHER than P: anchoring on
+        // "the main display" breaks when P itself is main, and anchoring on a stale
+        // Info breaks after hotplug. Our own workspaces are never anchors.
+        let physical = Displays.physical()
+        let anchor = physical.first { $0.id != displayID && $0.isMain }
+                  ?? physical.first { $0.id != displayID }
+        if let anchor {
+            let a = CGDisplayBounds(anchor.id)
+            let vOrigin = CGPoint(x: a.maxX, y: a.minY)
+            let pOrigin = CGPoint(x: a.maxX + CGFloat(w), y: a.minY + CGFloat(h))
             Displays.setOrigins([(vd.displayID, vOrigin), (displayID, pOrigin)])
-            Log.line("arranged: main.maxX=\(main.bounds.maxX) -> V@\(vOrigin), P@\(pOrigin) (corner contact)")
+            Log.line("arranged: anchor \(anchor.id).maxX=\(a.maxX) -> V@\(vOrigin), P@\(pOrigin) (corner contact)")
+        } else {
+            // P is the only physical display. Give V a shared edge on P's right so the
+            // cursor can still reach the workspace at all; the edge guard sweeps it off
+            // P. Degraded but not stranded.
+            let vOrigin = CGPoint(x: pBounds.maxX, y: pBounds.minY)
+            Displays.setOrigins([(vd.displayID, vOrigin)])
+            Log.line("arranged: no anchor (P is the only display) -> V@\(vOrigin) (shared edge)")
         }
 
-        let vBounds = CGDisplayBounds(vd.displayID)
-        mapping = WorkspaceMapping(pRect: CGDisplayBounds(displayID), pDisplayID: displayID,
-                                   vOrigin: vBounds.origin,
-                                   vSize: CGSize(width: vd.width, height: vd.height), vDisplayID: vd.displayID)
+        mapping = WorkspaceMapping(pDisplayID: displayID, vDisplayID: vd.displayID)
 
         repositionOverlay()
         overlay.orderFrontRegardless()
@@ -80,24 +96,32 @@ final class FlipController {
             self.scheduleCaptureRestart()
         }
         capture.start(displayID: vd.displayID)
-        Log.line("FlipController started: P=\(displayID) shows flipped workspace vID=\(vd.displayID) vBounds=\(vBounds)")
+        Log.line("FlipController started: P=\(displayID) shows flipped workspace vID=\(vd.displayID) vBounds=\(CGDisplayBounds(vd.displayID))")
     }
 
     /// False once the virtual display failed to start or was terminated by the system —
     /// reconcile() tears such controllers down and recreates them with a fresh workspace.
     var workspaceAlive: Bool { virtual != nil }
 
+    /// True when the physical output no longer matches the size the workspace was built
+    /// for (resolution change, reconnect at different mode). The workspace must be
+    /// rebuilt: capturing at the stale size skews the picture and fences the cursor
+    /// into only part of the output.
+    var needsRebuild: Bool {
+        let live = CGDisplayBounds(displayID).size
+        return !live.equalTo(.zero) && !live.equalTo(createdOutputSize)
+    }
+
     /// Keep the overlay covering the physical output after arrangement changes.
+    /// The frame is computed straight from live CG bounds: NSScreen's list refreshes
+    /// asynchronously after a reconfiguration, and a lookup racing that refresh used
+    /// to leave the overlay parked over a different (sometimes the main) display.
     func repositionOverlay() {
-        guard let screen = Displays.screen(for: displayID) else { return }
-        overlay.setFrame(screen.frame, display: true)
-        // Never fabricate a degenerate mapping (zero-size workspace): MirrorInput's edge
-        // guard would otherwise pin the cursor against an empty rect on a real display.
-        guard let vd = virtual, let prior = mapping else { mapping = nil; return }
-        mapping = WorkspaceMapping(pRect: CGDisplayBounds(displayID), pDisplayID: displayID,
-                                   vOrigin: CGDisplayBounds(vd.displayID).origin,
-                                   vSize: prior.vSize,
-                                   vDisplayID: vd.displayID)
+        let cg = CGDisplayBounds(displayID)
+        guard !cg.isEmpty else { return }
+        let mainH = CGDisplayBounds(CGMainDisplayID()).height
+        let frame = NSRect(x: cg.minX, y: mainH - cg.maxY, width: cg.width, height: cg.height)
+        overlay.setFrame(frame, display: true)
     }
 
     /// replayd occasionally tears the stream down mid-session (sleep/wake, daemon

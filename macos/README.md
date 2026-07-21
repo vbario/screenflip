@@ -63,11 +63,19 @@ On first launch you'll be asked to enable **ScreenFlip** under **System Settings
 
 ScreenFlip runs as a menu‑bar app (look for the **⇋** icon — no Dock icon, no window):
 
-- **Pick which displays to flip** — toggle any connected display in the menu. Selected displays become flipped workspaces. Your choice is remembered.
+- **Pick one external display to flip** — choose a connected non‑main display in the menu. The main display anchors ScreenFlip's hidden workspace and is intentionally unavailable. Your choice is remembered.
 - **Flip cursor to match mirror** — toggles whether the on‑screen cursor is also mirrored (↗) to match the flipped image, or kept normal‑facing (↖). Handy when you're viewing through a physical mirror.
 - **Restart all** / **Quit ScreenFlip** — quitting restores your original display arrangement.
 
 To use a flipped display, just move your mouse onto it and work normally — the windows you drag there appear mirrored, and the cursor stays correct.
+
+## Development status
+
+The current source version is 0.4. Run `./test.sh` for the cursor‑geometry tests,
+`./probe-virtual-display.sh` for a short local compatibility check of the private
+virtual‑display API, and `./build.sh` for an application build. See
+[`../PROJECT_PLAN.md`](../PROJECT_PLAN.md) for architecture, safety constraints,
+remaining hardware validation, and release work.
 
 ## Help & feedback
 
